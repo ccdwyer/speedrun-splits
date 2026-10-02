@@ -1,6 +1,6 @@
 {
   "name": "speedrun-splits",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A LiveSplit-style timer above the prompt that auto-splits on recon, first edit, tests, green, commit and PR, with personal bests and gold segments",
   "types": "./types/index.d.ts",
   "author": {
