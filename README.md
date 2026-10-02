@@ -58,3 +58,22 @@ A LiveSplit-style timer for Claude Code: it times every bug-to-PR run, splitting
 claude plugin validate .
 claude plugin test .
 ```
+
+## What it hooks
+
+Events this mod hooks, as `claude plugin validate` reads the module:
+
+- `session.start`
+- `session.end`
+- `command.run{command=splits}`
+- `prompt.submit`
+- `tool.call`
+- `ui.render{component=AbovePrompt}`
+
+Engine calls it makes: `$.clock.every (via startTicking`, `watchBackground)`, `$.clock.now`, `$.command.register`, `$.process.run (via commonDir`, `headOf`, `watchBackground)`, `$.session.repo (via repoOf)`, `$.state.get`, `$.state.set`, `$.store.delete (via clear`, `prune)`, `$.store.get`, `$.store.keys (via clear`, `finishedRuns)`, `$.store.set`, `$.ui.resolve`, `$.ui.toast (via finish)`.
+
+A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod uses that only for the behaviour described above.
+
+## License
+
+MIT
