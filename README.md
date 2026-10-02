@@ -1,5 +1,13 @@
 # Speedrun Splits
 
+![Speedrun Splits demo](media/demo.gif)
+
+Two runs of the same bug fix: the first sets a personal best, and the second shows live deltas against it.
+
+| First run sets a PB | Live deltas on the next run | `/splits` PB table |
+|---|---|---|
+| ![](media/01-first-pb.png) | ![](media/02-live-deltas.png) | ![](media/03-pb-table.png) |
+
 A LiveSplit-style timer for Claude Code: it times every bug-to-PR run, splitting automatically, with personal bests and gold segments per repo.
 
 ```
