@@ -1,0 +1,13 @@
+{
+  "name": "speedrun-splits",
+  "owner": {
+    "name": "Chris Dwyer"
+  },
+  "plugins": [
+    {
+      "name": "speedrun-splits",
+      "source": "./",
+      "description": "A LiveSplit-style timer above the prompt that auto-splits on recon, first edit, tests, green, commit and PR, with personal bests and gold segments"
+    }
+  ]
+}
