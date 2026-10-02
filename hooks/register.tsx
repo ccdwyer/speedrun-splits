@@ -215,11 +215,12 @@ export function ownerRepo(url: string): string | null {
 
 export function clock(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000))
-  const h = Math.floor(total / 3600)
+  const hours = Math.floor(total / 3600)
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
-  const mm = h > 0 ? String(m).padStart(2, '0') : String(m)
-  return `${h > 0 ? `${h}:` : ''}${mm}:${String(s).padStart(2, '0')}`
+  const mm = hours > 0 ? String(m).padStart(2, '0') : String(m)
+  const lead = hours > 0 ? String(hours) + ':' : ''
+  return lead + mm + ':' + String(s).padStart(2, '0')
 }
 
 export function delta(ms: number): string {
@@ -476,7 +477,7 @@ async function table($: EngineInterface): Promise<string> {
   }
   if (best.history.length > 0) {
     lines.push('', 'Recent runs:')
-    for (const h of best.history.slice(0, 5)) lines.push(`  ${h.date.slice(0, 16).replace('T', ' ')}  ${clock(h.total)}`)
+    for (const past of best.history.slice(0, 5)) lines.push(`  ${past.date.slice(0, 16).replace('T', ' ')}  ${clock(past.total)}`)
   }
   return lines.join('\n')
 }
@@ -762,7 +763,7 @@ export const register: Register = on => {
     const best = (await read($, record)) ?? emptyBest()
     const { Box, Text } = $.ui.resolve(e)
     const elapsed = (r.endedAt ?? Math.max(t, r.startedAt)) - r.startedAt
-    const highest = r.splits.reduce<number>((h, v, i) => (v !== null ? i : h), -1)
+    const highest = r.splits.reduce<number>((last, v, i) => (v !== null ? i : last), -1)
     const pending = r.splits.findIndex((v, i) => i > highest && v === null)
     const columns = e.props.bodyColumns ?? 80
     const room = Math.max(1, Math.floor((columns - 24) / 22))
