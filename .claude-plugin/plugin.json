@@ -8,5 +8,9 @@
     "url": "https://github.com/ccdwyer"
   },
   "repository": "https://github.com/ccdwyer/speedrun-splits",
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/ccdwyer/speedrun-splits",
+  "supportUrl": "https://github.com/ccdwyer/speedrun-splits/issues",
+  "documentationUrl": "https://github.com/ccdwyer/speedrun-splits#readme",
+  "privacyPolicyUrl": "https://github.com/ccdwyer/speedrun-splits/blob/main/PRIVACY.md"
 }
