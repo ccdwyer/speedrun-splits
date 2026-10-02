@@ -71,10 +71,13 @@ const TYPECHECK = new RegExp(
 const NOT_A_RUN =
   /(^|\s)(--help|-h|--version|-V|--collect-only|--co|--setup-only|--fixtures|--showConfig|--no-run|--listTests|--list-tests|--list|-list|--dry-run)(\s|=|$)|\b(vitest|jest)\s+list\b|\bgo\s+test\b.*\s-c(\s|$)/
 
-// The command as words: a quoted single word keeps its text (`pytest "--collect-only"`,
-// `cd "packages/app"`), quoted text with spaces is data and goes, comments go.
+// Characters that make quoted text shell syntax rather than one plain word.
+const OPERATORS = /[;&|<>()`$\n]/
+
+// The command as words: a quoted single plain word keeps its text (`pytest "--collect-only"`,
+// `cd "packages/app"`), other quoted text is data and goes, comments go.
 export function words(command: string): string {
-  const unwrap = (_: string, body: string) => (/^\S+$/.test(body) ? body : "''")
+  const unwrap = (_: string, body: string) => (/^\S+$/.test(body) && !OPERATORS.test(body) ? body : "''")
   return command
     .replace(/<<-?\s*['"]?(\w+)['"]?[\s\S]*?\n\1\b/g, ' ')
     .replace(/'([^']*)'/g, unwrap)
@@ -82,19 +85,37 @@ export function words(command: string): string {
     .replace(/(^|\s)#[^\n]*/g, '$1')
 }
 
-// Shell text ready to split into statements and parts.
-function prep(command: string): string {
-  return words(command)
-    .replace(/\|&/g, '|') // `|&` pipes stderr too: still a pipe
-    .replace(/\d*>&\d+|&>>?|>&/g, ' ') // redirections, not background jobs
-    .replace(/[()]/g, ' ') // subshell grouping
+// A lone `&` ends an and-or list and sends the whole list to the background
+// (`npm test && echo done &` backgrounds the test too).
+const LONE_AMP = /(?<!&)&(?!&)/
+
+// Pipes and redirections that look like `&` but are not background jobs.
+const unredirect = (text: string) => text.replace(/\|&/g, '|').replace(/\d*>&\d+|&>>?|>&/g, ' ')
+
+// A subshell that backgrounds a job inside it returns at once: for the outer list it is `true`.
+function maskBackgroundSubshells(text: string): string {
+  let s = text
+  for (let prev = ''; prev !== s; ) {
+    prev = s
+    s = s.replace(/\(([^()]*)\)/g, (_, body: string) => (LONE_AMP.test(body) ? ' true ' : `\u0001${body}\u0002`))
+  }
+  return s.replace(/\u0001/g, '(').replace(/\u0002/g, ')')
 }
 
-// Leading `VAR=x`, `timeout 60`, `time`, `env`, `command` don't change what runs.
+// Shell text ready to split into statements and parts, subshell grouping dropped.
+function prep(command: string): string {
+  return maskBackgroundSubshells(unredirect(words(command))).replace(/[()]/g, ' ')
+}
+
+// Words that start a command without changing which program it is: assignments, wrappers,
+// and the shell keywords that open a body (`then npm test`).
+const PREFIX =
+  /^(\w+=\S*|timeout(?:\s+-\S+)*\s+\S+|time|env(?:\s+-\S+)*|command|nice(?:\s+-n\s+\S+)?|nohup|sudo(?:\s+(?:-[ugCDhpr]\s+\S+|-\w+))*|then|do|else|elif|if|while|until|!|\{)\s+/
+
 function normalize(segment: string): string {
   let s = segment.trim()
   for (;;) {
-    const next = s.replace(/^(\w+=\S*|timeout\s+\S+|time|env|command|nice|nohup)\s+/, '')
+    const next = s.replace(PREFIX, '')
     if (next === s) return s
     s = next
   }
@@ -111,9 +132,19 @@ export type Shell = {
   startsAnyway: boolean
   // Success of the whole command proves a test suite ran and passed.
   provesPass: boolean
+  // An `exit` or `return` before the last statement can end the call, successfully, before the tests.
+  exitsEarly: boolean
 }
 
-const NONE: Shell = { runsTest: false, startsAnyway: false, provesPass: false }
+const NONE: Shell = { runsTest: false, startsAnyway: false, provesPass: false, exitsEarly: false }
+
+// The parts of a statement that run in the foreground: only the list after the last
+// lone `&`, split into its commands. Lists before a `&` run in the background, unseen.
+export function foreground(statement: string): string[] {
+  const lists = statement.split(LONE_AMP)
+  const last = lists[lists.length - 1] ?? ''
+  return last.trim() === '' ? [] : last.split(/&&|\|\|/)
+}
 
 export function analyze(command: string): Shell {
   const statements = prep(command).split(/;|\n/).filter(st => st.trim() !== '')
@@ -121,19 +152,22 @@ export function analyze(command: string): Shell {
   if (!runsTest) return NONE
   // Only the first statement surely runs: `set -e`, `exit` or a failure can stop the rest.
   const first = statements[0] ?? ''
-  const startsAnyway = hasTest(first.split(/&&|\|\||(?<!&)&(?!&)/)[0] ?? '')
-  // Only the last statement sets the exit status; a `&` in it sends its work to the background.
+  // The first command of the first statement runs whatever happens next, unless its list is backgrounded.
+  const startsAnyway = !LONE_AMP.test(first) && hasTest(first.split(/&&|\|\|/)[0] ?? '')
+  const exitsEarly = statements.slice(0, -1).some(st => /(^|[\s;&|])(exit|return)\b/.test(st))
+  // Only the last statement sets the exit status, and only its foreground list.
   const last = statements[statements.length - 1] ?? ''
-  const isBackground = /(^|[^&])&([^&]|$)/.test(last)
+  const fg = last.split(LONE_AMP).pop() ?? ''
   const provesPass =
-    !isBackground &&
-    !last.includes('||') &&
-    last.split('&&').some(part => {
+    !exitsEarly &&
+    fg.trim() !== '' &&
+    !fg.includes('||') &&
+    fg.split('&&').some(part => {
       const pipeline = part.split('|')
       // A pipeline's status is its last command's.
       return isRunner(normalize(pipeline[pipeline.length - 1] ?? ''))
     })
-  return { runsTest, startsAnyway, provesPass }
+  return { runsTest, startsAnyway, provesPass, exitsEarly }
 }
 
 // Did a test start, given whether the whole call succeeded? If it succeeded,
@@ -141,57 +175,157 @@ export function analyze(command: string): Shell {
 export function testStarted(shell: Shell, command: string, ok: boolean): boolean {
   if (!shell.runsTest) return false
   if (shell.startsAnyway) return true
-  if (!ok) return false
+  if (!ok || shell.exitsEarly) return false
   const statements = prep(command).split(/;|\n/).filter(st => st.trim() !== '')
   const last = statements[statements.length - 1] ?? ''
-  return !last.includes('||') && last.split(/&&|(?<!&)&(?!&)/).some(hasTest)
+  return !last.includes('||') && foreground(last).some(hasTest)
 }
 
-// Where a command's git work happens, as far as the text says: `here`, a
+// Where a command's git work or tests happen, as far as the text says: `here`, a
 // directory to resolve, or `unknown` (another git dir, or a target we can't read).
 export type Target = { kind: 'here' } | { kind: 'dir'; dir: string } | { kind: 'unknown' }
 
-// The git commit or `gh pr create` in a command: where it starts, and the git global options.
-const COMMIT_AT = /\bgit((?:\s+(?:-c\s+\S+|-C\s+\S+|--?[\w-]+(?:=\S+)?))*)\s+commit(?![\w-])/
-const PR_AT = /\bgh\s+pr\s+create\b/
+const HERE: Target = { kind: 'here' }
+const UNKNOWN: Target = { kind: 'unknown' }
+const unreadable = (dir: string) => /[$`~*?]/.test(dir) || dir === '' || dir === '-' || dir === "''"
 
-// Where the milestone in a command runs. Only what comes before it can move it;
-// anything ambiguous is `unknown`, so nothing is credited.
-export function gitTarget(command: string): Target {
-  const text = words(command)
-  if (/(^|\s)(GIT_DIR|GIT_WORK_TREE)=/.test(text)) return { kind: 'unknown' }
-  const commit = COMMIT_AT.exec(text)
-  const pr = PR_AT.exec(text)
-  const at = commit?.index ?? pr?.index ?? -1
-  const before = at === -1 ? text : text.slice(0, at)
-  if (/(^|[;&|\s])(pushd|popd)\b/.test(before)) return { kind: 'unknown' }
-  const cds = [...before.matchAll(/(^|[;&|(]\s*)cd\s+(\S+)/g)].map(m => m[2] ?? '')
-  // More than one hop, or one inside a subshell that may have ended: can't tell.
-  if (cds.length > 1 || (cds.length === 1 && before.includes('('))) return { kind: 'unknown' }
-  let dir: string | null = null
-  if (commit !== null) {
-    const opts = commit[1] ?? ''
-    if (/--git-dir|--work-tree/.test(opts)) return { kind: 'unknown' }
-    const cs = [...opts.matchAll(/-C\s+(\S+)/g)].map(m => m[1] ?? '')
-    if (cs.length > 1) return { kind: 'unknown' }
-    dir = cs[0] ?? null
-  }
-  const to = cds[0]
-  if (to !== undefined) {
-    if (/[$`~*?]/.test(to) || to === '' || to === '-' || to === "''") return { kind: 'unknown' }
-    if (dir === null) dir = to
-    else if (!dir.startsWith('/')) dir = `${to}/${dir}`
-  }
-  if (dir === null || dir === '.') return { kind: 'here' }
-  if (/[$`~*?]/.test(dir) || dir === "''") return { kind: 'unknown' }
-  return { kind: 'dir', dir }
+// The command split into its simple commands in order, with the subshell parentheses
+// and separators kept as their own tokens.
+function tokens(command: string): string[] {
+  return unredirect(words(command))
+    .split(/(\(|\)|;|\n|&&|\|\||\||&)/)
+    .filter(t => t.trim() !== '')
 }
 
-// `gh ... -R owner/repo` / `--repo owner/repo`: the repo, `unknown` if it can't be read, null if not given.
+const SEPARATOR = /^(;|\n|&&|\|\||\||&)$/
+
+// Walks a command's simple commands, tracking the directory each runs in: one `cd`
+// is followed (it ends with its subshell); a second, an unreadable one, or pushd/popd
+// makes everything after it `unknown`. `visit` returns a target to stop on.
+function walk(command: string, visit: (cmd: string, raw: string, dir: string | null, lost: boolean) => Target | null): Target | null {
+  const scopes: (string | null)[] = [null]
+  let hops = 0
+  let lost = false
+  for (const tok of tokens(command)) {
+    if (tok === '(') {
+      scopes.push(scopes[scopes.length - 1] ?? null)
+      continue
+    }
+    if (tok === ')') {
+      if (scopes.length > 1) scopes.pop()
+      continue
+    }
+    if (SEPARATOR.test(tok)) continue
+    const cmd = normalize(tok)
+    if (/^(pushd|popd)\b/.test(cmd)) {
+      lost = true
+      continue
+    }
+    const hop = /^cd(?:\s+(\S+))?\s*$/.exec(cmd)
+    if (hop !== null) {
+      const to = hop[1] ?? '~'
+      hops += 1
+      const cur = scopes[scopes.length - 1] ?? null
+      if (hops > 1 || unreadable(to)) lost = true
+      else scopes[scopes.length - 1] = to.startsWith('/') || cur === null ? to : `${cur}/${to}`
+      continue
+    }
+    const stop = visit(cmd, tok, scopes[scopes.length - 1] ?? null, lost)
+    if (stop !== null) return stop
+  }
+  return null
+}
+
+const asTarget = (dir: string | null): Target => (dir === null || dir === '.' ? HERE : unreadable(dir) ? UNKNOWN : { kind: 'dir', dir })
+
+// A runner's own directory option, before its script name and any `--`:
+// `npm --prefix app test`, `pnpm -C app test`, `make -C app test`.
+const DIR_OPT = /(?:^|\s)(?:--prefix|--cwd|--dir|--root-dir|-C)(?:\s+|=)(\S+)/
+function dirOption(cmd: string): string | null {
+  let head = cmd.split(/\s--(?:\s|$)/)[0] ?? ''
+  if (/^(npm|pnpm|yarn|bun)\b/.test(head)) head = head.split(/\s(?:run|exec|tests?)\b/)[0] ?? ''
+  return DIR_OPT.exec(head)?.[1] ?? null
+}
+
+// Where a command's tests run. Every test in it must run in the same place; otherwise,
+// or when the place can't be read, `unknown`.
+export function testTarget(command: string): Target {
+  let found: string | null | undefined
+  const stop = walk(command, (cmd, _raw, dir, lost) => {
+    if (!hasTest(cmd)) return null
+    if (lost) return UNKNOWN
+    const opt = dirOption(cmd)
+    if (opt !== null && unreadable(opt)) return UNKNOWN
+    const at = opt === null ? dir : opt.startsWith('/') || dir === null ? opt : `${dir}/${opt}`
+    const key = at === null || at === '.' ? null : at
+    if (found !== undefined && found !== key) return UNKNOWN
+    found = key
+    return null
+  })
+  return stop ?? asTarget(found ?? null)
+}
+
+// A git commit, or a `gh pr create`, as the program a simple command runs (global options allowed).
+const COMMIT_CMD = /^git((?:\s+(?:-c\s+\S+|-C\s+\S+|--?[\w-]+(?:=\S+)?))*)\s+commit(?![\w-])/
+const PR_CMD = /^gh((?:\s+(?:-R|--repo)(?:\s+|=)\S+|\s+--?[\w-]+(?:=\S+)?)*)\s+pr\s+create\b/
+
+// Does the command run a commit / `gh pr create` itself (not as text an `echo` prints)?
+export const hasCommit = (command: string) => walk(command, cmd => (COMMIT_CMD.test(cmd) ? HERE : null)) !== null
+export const hasPr = (command: string) => walk(command, cmd => (PR_CMD.test(cmd) ? HERE : null)) !== null
+
+// Where the milestone in a command runs. Anything ambiguous is `unknown`, so nothing is credited.
+export function gitTarget(command: string, which: 'commit' | 'pr' = 'commit'): Target {
+  if (/(^|\s)(GIT_DIR|GIT_WORK_TREE)=/.test(words(command))) return UNKNOWN
+  const re = which === 'commit' ? COMMIT_CMD : PR_CMD
+  const at = walk(command, (cmd, _raw, dir, lost) => {
+    const m = re.exec(cmd)
+    if (m === null) return null
+    if (lost) return UNKNOWN
+    if (which === 'pr') return asTarget(dir)
+    const opts = m[1] ?? ''
+    if (/--git-dir|--work-tree/.test(opts)) return UNKNOWN
+    const cs = [...opts.matchAll(/-C\s+(\S+)/g)].map(c => c[1] ?? '')
+    if (cs.length > 1) return UNKNOWN
+    const c = cs[0]
+    if (c === undefined) return asTarget(dir)
+    if (unreadable(c)) return UNKNOWN
+    return asTarget(c.startsWith('/') || dir === null ? c : `${dir}/${c}`)
+  })
+  return at ?? HERE
+}
+
+// The `gh pr create` simple command, its options, and what was set for it.
+function prCommand(command: string): { args: string; repo: string | undefined } | null {
+  let exported: string | undefined
+  let found: { args: string; repo: string | undefined } | null = null
+  walk(command, (cmd, raw) => {
+    const exp = /^export\s+GH_REPO=(\S+)/.exec(cmd)
+    if (exp !== null) {
+      exported = exp[1]
+      return null
+    }
+    const m = PR_CMD.exec(cmd)
+    if (m === null) return null
+    const flag = (text: string) => /(?:^|\s)(?:-R|--repo)(?:\s+|=)(\S+)/.exec(text)?.[1]
+    const assigned = /(?:^|\s)GH_REPO=(\S+)/.exec(raw.slice(0, Math.max(0, raw.search(/\bgh\b/))))?.[1]
+    found = { args: cmd.slice(m[0].length), repo: flag(cmd.slice(m[0].length)) ?? flag(m[1] ?? '') ?? assigned ?? exported }
+    return HERE
+  })
+  return found
+}
+
+// The repo `gh pr create` was pointed at (`-R`, `--repo`, or `GH_REPO` for that command):
+// owner/repo, `unknown` if it can't be read, null if it names none.
 export function ghRepoFlag(command: string): string | null {
-  const m = /\bgh\s+(?:\S+\s+)*?(?:-R|--repo)(?:\s+|=)(\S+)/.exec(words(command))
-  if (m === null) return null
-  return (m[1] === undefined ? null : ownerRepo(m[1])) ?? 'unknown'
+  const pr = prCommand(command)
+  if (pr === null || pr.repo === undefined) return null
+  return ownerRepo(pr.repo) ?? 'unknown'
+}
+
+// The branch `gh pr create` names with `--head` / `-H`, if any (`owner:branch` gives the branch).
+export function prHead(command: string): string | null {
+  const m = /(?:^|\s)(?:--head(?:\s+|=)|-H\s+)(\S+)/.exec(prCommand(command)?.args ?? '')
+  return m?.[1] === undefined ? null : m[1].replace(/^[^:]+:/, '')
 }
 
 // `owner/repo` from a remote URL, a PR URL, or `host/owner/repo`: host aliases,
@@ -506,17 +640,13 @@ async function commonDir($: EngineInterface, dir: string): Promise<string | null
   }
 }
 
-// Is the git work of this command in the session's repo?
-async function isHere($: EngineInterface, command: string): Promise<boolean> {
-  return (await dirOf($, command)) !== null
-}
-
 // The directory a command's milestone runs in, if it is in the session's repo.
-async function dirOf($: EngineInterface, command: string): Promise<string | null> {
-  const target = gitTarget(command)
+async function dirOf($: EngineInterface, command: string, which: 'commit' | 'pr' = 'commit'): Promise<string | null> {
+  const target = gitTarget(command, which)
   if (target.kind === 'here') return '.'
   if (target.kind === 'unknown') return null
-  const [there, here] = await Promise.all([commonDir($, target.dir), commonDir($, '.')])
+  const there = await commonDir($, target.dir)
+  const here = await commonDir($, '.')
   return there !== null && there === here ? target.dir : null
 }
 
@@ -524,19 +654,64 @@ type BashResult = {
   backgroundTaskId?: string
   interrupted?: boolean
   gitOperation?: { commit?: { kind: string }; pr?: { action: string; url?: string } }
-  bashEditDiff?: { files?: unknown[]; changedFiles?: string[]; unavailable?: true; skipped?: true }
+  bashEditDiff?: { files?: { filePath: string }[]; changedFiles?: string[]; unavailable?: true; skipped?: true }
 }
 
-// A shell command that the host saw change files.
-function changedFiles(result: BashResult): boolean {
+// Files a test run or a tool writes as a side effect: never a fix.
+const NOT_CODE = /(^|\/)(coverage|\.nyc_output|__snapshots__|\.pytest_cache|\.mypy_cache|\.ruff_cache|node_modules|\.turbo|\.next|dist|build)\/|\.snap$|\.lcov$|\.pyc$/
+
+// A path with `.` and `..` resolved.
+export function resolvePath(path: string): string {
+  const out: string[] = []
+  for (const seg of path.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') out.pop()
+    else out.push(seg)
+  }
+  return `/${out.join('/')}`
+}
+
+// Changed files the host saw a shell command make that look like code, absolute against `cwd`.
+export function changedCode(result: BashResult, cwd: string): string[] {
   const diff = result.bashEditDiff
-  if (diff === undefined || diff.unavailable === true || diff.skipped === true) return false
-  return (diff.files?.length ?? 0) > 0 || (diff.changedFiles?.length ?? 0) > 0
+  if (diff === undefined || diff.unavailable === true || diff.skipped === true) return []
+  const paths = [...(diff.changedFiles ?? []), ...(diff.files ?? []).map(f => f.filePath)]
+  const code = paths
+    .filter(f => typeof f === 'string' && f !== '')
+    .map(f => resolvePath(f.startsWith('/') ? f : `${cwd}/${f}`))
+    .filter(f => !NOT_CODE.test(f))
+  return [...new Set(code)]
+}
+
+// Is a path inside a directory?
+export function inside(path: string, root: string): boolean {
+  const p = resolvePath(path)
+  const r = resolvePath(root)
+  return p === r || p.startsWith(`${r === '/' ? '' : r}/`)
 }
 
 // Shell commands that move files without being a fix: not first blood.
-const NOT_A_FIX =
-  /(^|[;&|]\s*)((npm|pnpm|yarn|bun)\s+(i|install|add|ci|update|upgrade)\b|git\s+(checkout|switch|pull|merge|rebase|stash|reset|restore|clone)\b|pod\s+install\b)/
+// Wrappers and global options may sit between the program and its subcommand.
+const WRAP = String.raw`(?:(?:\w+=\S*|sudo|env|time|nice|nohup|command|timeout\s+\S+|then|do|else|if)\s+)*`
+const GIT_OPTS = String.raw`(?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*`
+const NOT_A_FIX = new RegExp(
+  String.raw`(?:^|[;&|\n(])\s*` +
+    WRAP +
+    '(' +
+    [
+      String.raw`(npm|pnpm|yarn|bun)${PM_OPTS}\s+(i|install|add|ci|update|upgrade)\b`,
+      String.raw`git${GIT_OPTS}\s+(checkout|switch|pull|merge|rebase|stash|reset|restore|clone|cherry-pick)\b`,
+      String.raw`pod\s+install\b`,
+      String.raw`(pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+install\b`,
+      String.raw`uv\s+(sync|add)\b`,
+      String.raw`poetry\s+(install|add|update|lock)\b`,
+      String.raw`bundle(\s+install)?\s*($|[;&|])`,
+      String.raw`composer\s+(install|update|require)\b`,
+      String.raw`go\s+(get|mod\s+(download|tidy))\b`,
+      String.raw`cargo\s+(fetch|update)\b`,
+    ].join('|') +
+    ')',
+)
 
 // What HEAD is in a directory now, to tell a new commit from an old one.
 async function headOf($: EngineInterface, dir: string): Promise<string | null> {
@@ -548,6 +723,127 @@ async function headOf($: EngineInterface, dir: string): Promise<string | null> {
   }
 }
 
+// Every remote of a repo as owner/repo: a fork's PRs are opened on its parent.
+async function remotesOf($: EngineInterface, dir: string): Promise<Set<string>> {
+  const repos = new Set<string>()
+  try {
+    const out = await $.process.run(['git', '-C', dir, 'remote', '-v'], { timeoutMs: 3000 })
+    if (out.exitCode !== 0) return repos
+    for (const line of out.stdout.split('\n')) {
+      const url = line.split(/\s+/)[1]
+      const r = url === undefined ? null : ownerRepo(url)
+      if (r !== null) repos.add(r)
+    }
+  } catch {
+    // No remotes known.
+  }
+  return repos
+}
+
+// The repos a PR for this run may be opened on: the run's own, the checkout's
+// remotes, and the fork parent GitHub knows of (gh opens a fork's PRs on its parent).
+async function ourRepos($: EngineInterface, dir: string, runRepo: string | null): Promise<Set<string>> {
+  const repos = await remotesOf($, dir)
+  if (runRepo !== null && !runRepo.startsWith('/')) repos.add(runRepo)
+  try {
+    const out = await $.process.run(['gh', 'repo', 'view', '--json', 'nameWithOwner,parent'], { timeoutMs: 8000, cwd: dir })
+    if (out.exitCode === 0) {
+      const info = JSON.parse(out.stdout) as { nameWithOwner?: string; parent?: { owner?: { login?: string }; name?: string } | null }
+      if (typeof info.nameWithOwner === 'string') repos.add(info.nameWithOwner.toLowerCase())
+      const login = info.parent?.owner?.login
+      const name = info.parent?.name
+      if (typeof login === 'string' && typeof name === 'string') repos.add(`${login}/${name}`.toLowerCase())
+    }
+  } catch {
+    // Offline or no gh: the remotes stand.
+  }
+  return repos
+}
+
+// Is a PR opened by this command one for the run's repo? Its URL decides when the host
+// gives one; else the repo `gh pr create` was pointed at; else it is this checkout's.
+async function prIsOurs($: EngineInterface, command: string, dir: string, url: string | undefined, runRepo: string | null): Promise<boolean> {
+  if (url !== undefined) {
+    const named = ownerRepo(url)
+    return named !== null && (await ourRepos($, dir, runRepo)).has(named)
+  }
+  const flag = ghRepoFlag(command)
+  if (flag === null) return true
+  if (flag === 'unknown') return false
+  return (await ourRepos($, dir, runRepo)).has(flag)
+}
+
+// The branch `gh pr create` opens from: its `--head`, else the checkout's branch.
+async function prBranch($: EngineInterface, command: string, dir: string): Promise<string | null> {
+  const named = prHead(command)
+  if (named !== null) return named
+  try {
+    const out = await $.process.run(['git', '-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeoutMs: 3000 })
+    const b = out.stdout.trim()
+    return out.exitCode === 0 && b !== '' && b !== 'HEAD' ? b : null
+  } catch {
+    return null
+  }
+}
+
+// Did HEAD in this directory move by a commit (not a checkout, pull, reset or cherry-pick)?
+// The reflog says how HEAD got where it is.
+async function landedCommit($: EngineInterface, dir: string, was: string | null): Promise<boolean> {
+  const head = await headOf($, dir)
+  if (head === null || head === was) return false
+  try {
+    const out = await $.process.run(['git', '-C', dir, 'reflog', '-1', '--format=%H %gs', 'HEAD'], { timeoutMs: 3000 })
+    if (out.exitCode !== 0) return false
+    const line = out.stdout.trim()
+    const sha = line.split(' ')[0]
+    const subject = line.slice((sha ?? '').length + 1)
+    return sha === head && /^commit( \((amend|initial|merge)\))?:/.test(subject)
+  } catch {
+    return false
+  }
+}
+
+// When the commit at HEAD was made: its committer date, clamped to the command's window.
+async function commitTime($: EngineInterface, dir: string, since: number, t: number): Promise<number> {
+  try {
+    const out = await $.process.run(['git', '-C', dir, 'log', '-1', '--format=%ct'], { timeoutMs: 3000 })
+    const text = out.stdout.trim()
+    if (out.exitCode !== 0 || !/^\d+$/.test(text)) return t
+    return Math.min(t, Math.max(since, Number(text) * 1000))
+  } catch {
+    return t
+  }
+}
+
+// The PRs on a branch, by URL, with when each was created.
+async function prsOn($: EngineInterface, dir: string, branch: string, repo: string | null): Promise<Map<string, number> | null> {
+  const argv = ['gh', 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'url,createdAt', '--limit', '20']
+  if (repo !== null) argv.push('--repo', repo)
+  try {
+    const out = await $.process.run(argv, { timeoutMs: 8000, cwd: dir })
+    if (out.exitCode !== 0) return null
+    const found = new Map<string, number>()
+    for (const pr of JSON.parse(out.stdout) as { url?: string; createdAt?: string }[]) {
+      const at = Date.parse(pr.createdAt ?? '')
+      if (typeof pr.url === 'string' && Number.isFinite(at)) found.set(pr.url, at)
+    }
+    return found
+  } catch {
+    return null
+  }
+}
+
+// When a PR this command opened was created, if one has appeared. GitHub reports whole
+// seconds, so the command's own second counts; PRs that were there before never do.
+async function newPr($: EngineInterface, w: Watch): Promise<number | null> {
+  if (w.branch === null) return null
+  const prs = await prsOn($, w.dir, w.branch, w.prRepo)
+  if (prs === null) return null
+  const floor = Math.floor(w.since / 1000) * 1000
+  const times = [...prs].filter(([url, at]) => !w.existing.has(url) && at >= floor).map(([, at]) => Math.max(at, w.since))
+  return times.length === 0 ? null : Math.min(...times)
+}
+
 // Background commit and PR commands finish later, out of sight of this hook:
 // one watcher each, polling for up to ten minutes.
 const watchers = new Map<string, Timer>()
@@ -557,50 +853,115 @@ function stopWatchers() {
   watchers.clear()
 }
 
-type Watch = { id: string; dir: string; since: number; head: string | null; wantsCommit: boolean; wantsPr: boolean; repo: string | null }
+type Watch = {
+  key: string
+  id: string
+  dir: string
+  since: number
+  head: string | null
+  wantsCommit: boolean
+  wantsPr: boolean
+  branch: string | null
+  prRepo: string | null
+  existing: Set<string>
+}
 
 function watchBackground($: EngineInterface, w: Watch) {
-  const key = `${w.id}:${w.since}:${w.wantsCommit ? 'c' : ''}${w.wantsPr ? 'p' : ''}`
   let polls = 0
+  let done = false
+  const timer: Timer = $.clock.every(10_000, () => {
+    void poll().catch(() => undefined)
+  })
+  // Each watcher cancels only its own timer, and forgets only its own entry.
   const stop = () => {
-    watchers.get(key)?.cancel()
-    watchers.delete(key)
+    done = true
+    timer.cancel()
+    if (watchers.get(w.key) === timer) watchers.delete(w.key)
   }
-  watchers.set(
-    key,
-    $.clock.every(10_000, () => {
-      void (async () => {
-        polls += 1
-        const r = await read($, run)
-        if (r === null || r.id !== w.id || r.endedAt !== null || polls > 60) return stop()
-        const t = await $.clock.now()
-        if (w.wantsCommit && w.head !== null) {
-          const head = await headOf($, w.dir)
-          if (head !== null && head !== w.head) {
-            const out = await $.process.run(['git', '-C', w.dir, 'log', '-1', '--format=%ct'], { timeoutMs: 3000 })
-            const ct = Number(out.stdout.trim()) * 1000
-            // The commit landed between the command's start and now; its own date is editable.
-            const at = Number.isFinite(ct) ? Math.min(t, Math.max(w.since, ct)) : t
-            await split($, w.id, COMMIT, at)
-            if (!w.wantsPr) return stop()
-          }
-        }
-        if (w.wantsPr) {
-          const out = await $.process.run(['gh', 'pr', 'view', '--json', 'url,createdAt'], { timeoutMs: 8000, cwd: w.dir })
-          if (out.exitCode === 0) {
-            const pr = JSON.parse(out.stdout) as { url?: string; createdAt?: string }
-            const at = Date.parse(pr.createdAt ?? '')
-            const target = pr.url === undefined ? null : ownerRepo(pr.url)
-            const sameRepo = w.repo === null || w.repo.startsWith('/') || target === w.repo
-            if (Number.isFinite(at) && at >= w.since && sameRepo) {
-              await split($, w.id, PR, Math.min(t, at))
-              return stop()
-            }
-          }
-        }
-      })().catch(() => undefined)
-    }),
-  )
+  const poll = async () => {
+    if (done) return
+    polls += 1
+    const r = await read($, run)
+    if (r === null || r.id !== w.id || r.endedAt !== null || polls > 60) return stop()
+    const t = await $.clock.now()
+    if (w.wantsCommit && (await landedCommit($, w.dir, w.head))) {
+      await split($, w.id, COMMIT, await commitTime($, w.dir, w.since, t))
+      if (!w.wantsPr) return stop()
+    }
+    if (w.wantsPr && w.branch !== null) {
+      const at = await newPr($, w)
+      if (at !== null) {
+        await split($, w.id, PR, Math.min(t, at))
+        return stop()
+      }
+    }
+  }
+  watchers.get(w.key)?.cancel()
+  watchers.set(w.key, timer)
+}
+
+// Did a shell command change code in this repo? Its changed files go through the same
+// rule as an edit's.
+async function shellChangedCode($: EngineInterface, result: BashResult, root: string | null): Promise<boolean> {
+  const diff = result.bashEditDiff
+  if (diff === undefined) return false
+  let cwd = root ?? '/'
+  try {
+    cwd = await $.session.cwd()
+  } catch {
+    // Relative paths are read against the repo root.
+  }
+  for (const path of changedCode(result, cwd).slice(0, 20)) {
+    if (await editIsHere($, path, root)) return true
+  }
+  return false
+}
+
+// In a command that changed code, does a test run after something else ran first?
+// (`npm test && sed -i ...` is a baseline run; `python fix.py && npm test` is not.)
+export function testAfterChange(command: string): boolean {
+  let before = 0
+  let after = false
+  walk(command, cmd => {
+    if (hasTest(cmd)) {
+      after = before > 0
+      return HERE
+    }
+    before += 1
+    return null
+  })
+  return after
+}
+
+// The session repo's root, or null when there is none.
+async function rootOf($: EngineInterface): Promise<string | null> {
+  try {
+    const repo = await $.session.repo()
+    return repo === null ? null : repo.root
+  } catch {
+    return null
+  }
+}
+
+// Is an edited file in this repo? Under its root, or in another worktree of it.
+async function editIsHere($: EngineInterface, path: string, root: string | null): Promise<boolean> {
+  if (path === '' || NOT_CODE.test(path)) return false
+  if (root !== null && inside(path, root)) return true
+  const dir = resolvePath(path).replace(/\/[^/]*$/, '') || '/'
+  const there = await commonDir($, dir)
+  const here = await commonDir($, '.')
+  // Another worktree of this repo counts; with no repo at all, so does a file in no repo.
+  return there === here && (there !== null || root === null)
+}
+
+// Do a command's tests run in this repo?
+async function testsAreHere($: EngineInterface, command: string): Promise<boolean> {
+  const target = testTarget(command)
+  if (target.kind === 'here') return true
+  if (target.kind === 'unknown') return false
+  const there = await commonDir($, target.dir)
+  const here = await commonDir($, '.')
+  return there !== null && there === here
 }
 
 export const register: Register = on => {
@@ -682,22 +1043,39 @@ export const register: Register = on => {
     // a baseline run that finishes after an edit is still a baseline run.
     let afterBlood = false
     let startedAt = 0
-    let gitDir: string | null = null
+    let commitDir: string | null = null
     let head: string | null = null
+    let prDir: string | null = null
+    let branch: string | null = null
+    // PRs already on the branch; null when they could not be read (then no background watch).
+    let existing: Set<string> | null = null
+    // The session's repo root: first blood must be a change inside it.
+    let root: string | null = null
     try {
       const r = await read($, run)
       await ensureTicking($, r)
       id = r !== null && r.endedAt === null ? r.id : null
       repo = r?.repo ?? null
       afterBlood = r?.splits[FIRST_BLOOD] !== null && r?.splits[FIRST_BLOOD] !== undefined
+      if (id !== null && !afterBlood) root = await rootOf($)
       if (id !== null && e.tool === 'Bash') {
         command = String(e.command ?? '')
         shell = analyze(command)
         startedAt = await $.clock.now()
         // A commit that may go to the background: remember HEAD, to know a new commit when it lands.
-        if (COMMIT_AT.test(words(command))) {
-          gitDir = await dirOf($, command)
-          head = gitDir === null ? null : await headOf($, gitDir)
+        if (hasCommit(command)) {
+          commitDir = await dirOf($, command, 'commit')
+          head = commitDir === null ? null : await headOf($, commitDir)
+        }
+        // A PR that may go to the background: remember the PRs already on its branch.
+        if (hasPr(command)) {
+          prDir = await dirOf($, command, 'pr')
+          if (prDir !== null) {
+            branch = await prBranch($, command, prDir)
+            const flag = ghRepoFlag(command)
+            const prs = branch === null ? null : await prsOn($, prDir, branch, flag === null || flag === 'unknown' ? null : flag)
+            existing = prs === null ? null : new Set(prs.keys())
+          }
         }
       }
     } catch {
@@ -714,40 +1092,69 @@ export const register: Register = on => {
       if (e.tool === 'Read') {
         if (isMain && ok) await split($, id, RECON, t)
       } else if (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') {
-        // Any agent's change counts: delegated fixes are still fixes.
-        if (ok && result.staged !== true) await split($, id, FIRST_BLOOD, t)
+        // Any agent's change counts, delegated fixes included, if it is code in this repo.
+        const args = e as { file_path?: unknown; notebook_path?: unknown }
+        const path = String(args.file_path ?? args.notebook_path ?? '')
+        if (ok && result.staged !== true && !afterBlood && (await editIsHere($, path, root))) await split($, id, FIRST_BLOOD, t)
       } else if (e.tool === 'Bash') {
         if (result.backgroundTaskId !== undefined) {
-          const text = words(command)
-          const wantsCommit = COMMIT_AT.test(text) && head !== null
-          const wantsPr = PR_AT.test(text) && ghRepoFlag(command) === null
-          const dir = gitDir ?? (await dirOf($, command))
-          if ((wantsCommit || wantsPr) && dir !== null) {
-            watchBackground($, { id, dir, since: startedAt, head, wantsCommit, wantsPr, repo })
+          // The task runs on in the background: a test at its start has started; its result is unseen.
+          if (afterBlood && shell.startsAnyway && (await testsAreHere($, command))) await split($, id, TEST_RUN, startedAt)
+          const flag = ghRepoFlag(command)
+          const prRepo = flag === null || flag === 'unknown' ? null : flag
+          if (commitDir !== null) {
+            watchBackground($, {
+              key: `${id}:${result.backgroundTaskId}:commit`,
+              id,
+              dir: commitDir,
+              since: startedAt,
+              head,
+              wantsCommit: true,
+              wantsPr: false,
+              branch: null,
+              prRepo: null,
+              existing: new Set(),
+            })
+          }
+          if (prDir !== null && branch !== null && existing !== null && (await prIsOurs($, command, prDir, undefined, repo))) {
+            watchBackground($, {
+              key: `${id}:${result.backgroundTaskId}:pr`,
+              id,
+              dir: prDir,
+              since: startedAt,
+              head: null,
+              wantsCommit: false,
+              wantsPr: true,
+              branch,
+              prRepo,
+              existing,
+            })
           }
           return ran
         }
         // An interrupted command proves nothing.
         if (result.interrupted === true) return ran
-        if (ok && changedFiles(result) && !NOT_A_FIX.test(words(command))) await split($, id, FIRST_BLOOD, t)
-        if (afterBlood && testStarted(shell, command, ok)) {
+        let fresh = false
+        if (ok && !afterBlood && !NOT_A_FIX.test(words(command)) && (await shellChangedCode($, result, root))) {
+          await split($, id, FIRST_BLOOD, t)
+          // `python fix.py && npm test`: the tests ran after this call's change.
+          fresh = testAfterChange(command)
+        }
+        if ((afterBlood || fresh) && testStarted(shell, command, ok) && (await testsAreHere($, command))) {
           // The test-run segment ends when the tests start; their run time counts toward green.
-          await split($, id, TEST_RUN, startedAt)
+          // Tests run after a change in the same call can't be timed apart from it.
+          await split($, id, TEST_RUN, fresh ? t : startedAt)
           if (ok && shell.provesPass) await split($, id, GREEN, t)
         }
         // A commit made before a later step failed is still a commit.
         const op = result.gitOperation
-        if (op !== undefined && (await isHere($, command))) {
-          const kind = op.commit?.kind
-          if (kind === 'committed' || kind === 'amended') await split($, id, COMMIT, t)
-          if (op.pr?.action === 'created') {
-            const target = op.pr.url === undefined ? ghRepoFlag(command) : ownerRepo(op.pr.url)
-            // Credit a PR only to the repo it was opened on; with no remote to compare, the
-            // PR must not name a repo at all. An unreadable `-R` is never this repo.
-            const sameRepo =
-              target === null || (target !== 'unknown' && repo !== null && !repo.startsWith('/') && repo === target)
-            if (sameRepo) await split($, id, PR, t)
-          }
+        const kind = op?.commit?.kind
+        if ((kind === 'committed' || kind === 'amended') && (await dirOf($, command, 'commit')) !== null) {
+          await split($, id, COMMIT, t)
+        }
+        if (op?.pr?.action === 'created') {
+          const dir = await dirOf($, command, 'pr')
+          if (dir !== null && (await prIsOurs($, command, dir, op.pr.url, repo))) await split($, id, PR, t)
         }
       }
     } catch {

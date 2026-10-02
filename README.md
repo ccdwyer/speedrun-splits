@@ -26,7 +26,8 @@ A LiveSplit-style timer for Claude Code: it times every bug-to-PR run, splitting
   6. **PR**: a PR Claude Code reports as created on this repo (a draft counts: it's open)
 - The run finishes on exactly its finish line: the PR by default, or the commit with `finish-on commit`.
 - Tests started before the first change count as recon, even if they finish after it.
-- Git milestones aimed at another repo (`git -C`, a `cd` into another checkout, `GIT_DIR`, `gh -R`, a PR URL for a different repo) aren't credited. A commit or PR command sent to the background is watched for up to ten minutes and splits when it lands.
+- Every split belongs to this repo. An edit (or a shell command's changed files) outside it, a test run after a `cd` into another checkout or `npm --prefix` elsewhere, and a commit there don't split. Snapshot, coverage and build output, installs (`npm install`, `pip install`, `poetry install`, ...) and history moves (`checkout`, `pull`, `cherry-pick`, ...) are not first blood. A fix and its tests in one command (`python fix.py && npm test`) count as both.
+- A PR counts when GitHub opened it on this repo, its fork parent, or one of its remotes: the PR URL decides when Claude Code reports one, else `gh pr create -R`/`--repo`/`GH_REPO`, else the checkout's repo. A commit or PR command sent to the background is watched for up to ten minutes. A commit counts only when the reflog says HEAD moved by a commit (not a checkout, pull or reset); a PR only if it wasn't already on the branch. A test sent to the background marks the test run but never green, since its result isn't seen.
 - A run that never changed code is kept in history but can't set a PB or a gold.
 - Each split shows its delta against your personal best, green when you're ahead and red when behind. A ★ marks a gold segment, the fastest you've ever done that phase. The clock ticks live.
 - PBs, gold segments and the last 20 runs are kept across sessions, per repo (by its normalized remote, else its root) and per finish line, so commit runs never compete with PR runs. Each finished run is stored under its own key and the board is folded from them, so two sessions finishing at once can't overwrite each other.
@@ -70,13 +71,13 @@ Events this mod hooks, as `claude plugin validate` reads the module:
 - `tool.call`
 - `ui.render{component=AbovePrompt}`
 
-Engine calls it makes: `$.clock.every (via startTicking`, `watchBackground)`, `$.clock.now`, `$.command.register`, `$.process.run (via commonDir`, `headOf`, `watchBackground)`, `$.session.repo (via repoOf)`, `$.state.get`, `$.state.set`, `$.store.delete (via clear`, `prune)`, `$.store.get`, `$.store.keys (via clear`, `finishedRuns)`, `$.store.set`, `$.ui.resolve`, `$.ui.toast (via finish)`.
+Engine calls it makes: $.clock.every (via startTicking, watchBackground), $.clock.now, $.command.register, $.process.run (via commitTime, commonDir, headOf, landedCommit, ourRepos, prBranch, prsOn, remotesOf), $.session.cwd (via shellChangedCode), $.session.repo (via repoOf, rootOf), $.state.get, $.state.set, $.store.delete (via clear, prune), $.store.get, $.store.keys (via clear, finishedRuns), $.store.set, $.ui.resolve, $.ui.toast (via finish).
 
-A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod uses that only for the behaviour described above.
+A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod only observes: it never refuses or changes a call.
 
 ## Privacy
 
-It runs entirely on your machine. It sends nothing over the network. Run times and personal bests are kept in Claude Code's local plugin store.
+Timing runs entirely on your machine, and run times and personal bests are kept in Claude Code's local plugin store. The one exception: when a command runs `gh pr create`, the mod uses your existing GitHub CLI (`gh`) login to ask GitHub which pull requests are on that branch and which repo is this checkout's fork parent, so it can tell when the PR lands and whether it belongs to this run. Those requests go only to GitHub (or your GitHub Enterprise host), under your own account, and send nothing but the repo and branch names. Nothing is sent anywhere else.
 
 The mod collects no analytics or telemetry, and its author receives no data from it.
 

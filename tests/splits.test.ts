@@ -4,15 +4,21 @@ import type { On } from 'claude-code'
 import {
   analyze,
   asFinished,
+  changedCode,
   board,
   clock,
   fold,
+  ghRepoFlag,
   gitTarget,
+  hasCommit,
+  hasPr,
+  prHead,
   ownerRepo,
   PHASES,
   segment,
   sumOfBest,
   testStarted,
+  testTarget,
 } from '../hooks/register'
 import type { Finished } from '../types'
 
@@ -43,6 +49,7 @@ function world(on: On, below = '', remote: string | null = null) {
     return { value: undefined }
   })
   on('session.repo', () => ({ value: { root: '/work/acme', remote, internal: false, name: 'acme' } }))
+  on('session.cwd', () => ({ value: '/work/acme' }))
   on('ui.toast', (_$, e) => {
     toasts.push(String((e as { text?: unknown }).text ?? ''))
     return { value: undefined }
@@ -115,7 +122,7 @@ test('fake passes do not count as green', async ($, on) => {
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
   await time.advance(1_000)
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(1_000)
   await $.tool.call({ tool: 'Bash', command: 'npm test || true' })
   await $.tool.call({ tool: 'Bash', command: 'npm test; echo done' })
@@ -147,9 +154,9 @@ test('tests before the first edit are recon, and edit-before-read never goes neg
   await time.advance(2_000)
   await $.tool.call({ tool: 'Bash', command: 'npm test' })
   await time.advance(3_000)
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(4_000)
-  await $.tool.call({ tool: 'Read', file_path: '/a' })
+  await $.tool.call({ tool: 'Read', file_path: '/work/acme/a' })
   await time.advance(1_000)
   await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
   const best = boardOf(store, KEY_COMMIT) as Best
@@ -166,9 +173,9 @@ test('a delegated fix counts: subagent edit, tests and commit; but not its reads
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
   const sub = { agentId: 'sub-1' }
-  await $.tool.call({ tool: 'Read', file_path: '/x', ...sub } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/work/acme/x', ...sub } as never)
   await time.advance(1_000)
-  await $.tool.call({ tool: 'Edit', file_path: '/x', old_string: 'a', new_string: 'b', ...sub } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/x', old_string: 'a', new_string: 'b', ...sub } as never)
   await time.advance(1_000)
   await $.tool.call({ tool: 'Bash', command: 'npm test', ...sub } as never)
   await time.advance(1_000)
@@ -202,7 +209,7 @@ test('the finish line is exact: amend finishes commit mode, a PR does not, cherr
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
   await time.advance(1_000)
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
   await $.tool.call({ tool: 'Bash', command: 'git cherry-pick abc' })
   expect(boardOf(store, KEY_COMMIT)).toBe(undefined)
@@ -217,7 +224,7 @@ test('git milestones aimed at another repo are not credited', async ($, on) => {
   on('tool.call', (_$, e) => (e.tool === 'Bash' ? committed : { result: { staged: false } }))
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(1_000)
   await $.tool.call({ tool: 'Bash', command: 'git -C /other/repo commit -am x' })
   expect(boardOf(store, KEY_COMMIT)).toBe(undefined)
@@ -228,7 +235,7 @@ test('commit and PR finish lines keep separate records; notifications start no r
   on('tool.call', (_$, e) => (e.tool === 'Bash' ? committed : { result: { staged: false } }))
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(7_000)
   await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
   expect((boardOf(store, KEY_COMMIT) as Best).pb?.total).toBe(7_000)
@@ -336,7 +343,8 @@ test('pure helpers', () => {
   expect(gitTarget('git -C . -C /other commit -am x')).toEqual({ kind: 'unknown' })
   expect(gitTarget('git commit -am x && cd /tmp')).toEqual({ kind: 'here' })
   expect(gitTarget('cd "packages/app" && git commit -am x')).toEqual({ kind: 'dir', dir: 'packages/app' })
-  expect(gitTarget('(cd /other && make) && git commit -am x')).toEqual({ kind: 'unknown' })
+  // The subshell's cd ends with it.
+  expect(gitTarget('(cd /other && make) && git commit -am x')).toEqual({ kind: 'here' })
   expect(gitTarget('pushd /other && git commit -am x')).toEqual({ kind: 'unknown' })
   expect(ownerRepo('https://user:tok@github.com/Org/Repo.git')).toBe('org/repo')
   expect(ownerRepo('git@github.com-work:org/repo.git')).toBe('org/repo')
@@ -375,7 +383,7 @@ test('the band composes with what other plugins draw above the prompt', async ($
   on('tool.call', () => bash())
   await $.prompt.submit(person('go'))
   await time.advance(3_000)
-  await $.tool.call({ tool: 'Read', file_path: '/a' })
+  await $.tool.call({ tool: 'Read', file_path: '/work/acme/a' })
   const ui = await $.ui.mount({
     plugin: 'speedrun-splits',
     surface: 'terminal',
@@ -401,7 +409,7 @@ test('another session’s run saved meanwhile is kept, and the slower one never 
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
   await time.advance(1_000)
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(4_000)
   await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
   const best = boardOf(store, KEY_COMMIT) as Best
@@ -417,9 +425,9 @@ test('a PR opened on another repo is not this run’s finish', async ($, on) => 
     return bash({ gitOperation: { pr: { number: 1, action: 'created', url } } })
   })
   await $.prompt.submit(person('go'))
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(1_000)
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill # other' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill -R org/other' })
   expect(boardOf(store, KEY)).toBe(undefined)
   await time.advance(1_000)
   await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
@@ -431,13 +439,19 @@ test('a backgrounded commit is picked up when it lands', async ($, on) => {
   let head = 'aaa'
   on('process.run', (_$, e) => {
     const argv = (e as { argv?: string[] }).argv ?? []
-    const stdout = argv.includes('log') ? `${Math.floor(1_006_000 / 1000)}\n` : argv.includes('HEAD') ? `${head}\n` : '/work/acme/.git\n'
+    const stdout = argv.includes('reflog')
+      ? `${head} commit: x\n`
+      : argv.includes('log')
+        ? `${Math.floor(1_006_000 / 1000)}\n`
+        : argv.includes('HEAD')
+          ? `${head}\n`
+          : '/work/acme/.git\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('tool.call', (_$, e) => (e.tool === 'Bash' ? bash({ backgroundTaskId: 'b1' }) : { result: { staged: false } }))
   await $.command.run(splitsCommand('finish-on commit'))
   await $.prompt.submit(person('go'))
-  await $.tool.call({ tool: 'Edit', file_path: '/a', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
   await time.advance(5_000)
   await $.tool.call({ tool: 'Bash', command: 'git commit -am x', run_in_background: true } as never)
   // No new commit yet: an old HEAD never counts.
@@ -446,4 +460,360 @@ test('a backgrounded commit is picked up when it lands', async ($, on) => {
   head = 'bbb'
   await time.advance(10_000)
   expect((boardOf(store, KEY_COMMIT) as Best).pb?.total).toBe(6_000)
+})
+
+// A git world for the repo checks: common dirs, remotes, HEAD and its reflog.
+type Git = { head: string | null; reflog: string; remotes: string; prs: string; parent?: string }
+function gitWorld(on: On, git: Git) {
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    const at = argv[2] ?? '.'
+    let stdout = ''
+    let exitCode = 0
+    if (argv.includes('--git-common-dir')) stdout = at === '.' || at.startsWith('/work/acme') || !at.startsWith('/') ? '/work/acme/.git' : '/other/.git'
+    else if (argv.includes('remote')) stdout = git.remotes
+    else if (argv.includes('reflog')) stdout = git.reflog
+    else if (argv.includes('--abbrev-ref')) stdout = 'fix-bug'
+    else if (argv[0] === 'gh' && argv[1] === 'repo') {
+      const [login, name] = (git.parent ?? '').split('/')
+      stdout = JSON.stringify({ nameWithOwner: 'me/acme', parent: git.parent === undefined ? null : { owner: { login }, name } })
+    } else if (argv[0] === 'gh') stdout = git.prs
+    else if (argv.includes('log')) stdout = `${Math.floor(1_006_000 / 1000)}`
+    else if (argv.includes('HEAD')) {
+      if (git.head === null) exitCode = 128
+      else stdout = git.head
+    }
+    return { value: { exitCode, stdout: `${stdout}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+}
+
+test('a background commit counts only when the reflog says HEAD moved by a commit', async ($, on) => {
+  const { time, store } = world(on)
+  const git: Git = { head: 'aaa', reflog: 'aaa commit: old', remotes: '', prs: '[]' }
+  gitWorld(on, git)
+  on('tool.call', (_$, e) => (e.tool === 'Bash' ? bash({ backgroundTaskId: 'b1' }) : { result: { staged: false } }))
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(5_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x', run_in_background: true } as never)
+  // The commit failed; a checkout moves HEAD later. Not a commit.
+  git.head = 'ccc'
+  git.reflog = 'ccc checkout: moving from fix-bug to main'
+  await time.advance(10_000)
+  expect(boardOf(store, KEY_COMMIT)).toBe(undefined)
+  git.head = 'ddd'
+  git.reflog = 'ddd commit (amend): x'
+  await time.advance(10_000)
+  expect((boardOf(store, KEY_COMMIT) as Best).pb?.total).toBe(6_000)
+})
+
+test('the first commit in a new repo is picked up in the background', async ($, on) => {
+  const { time, store } = world(on)
+  const git: Git = { head: null, reflog: '', remotes: '', prs: '[]' }
+  gitWorld(on, git)
+  on('tool.call', (_$, e) => (e.tool === 'Bash' ? bash({ backgroundTaskId: 'b2' }) : { result: { staged: false } }))
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(5_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am first', run_in_background: true } as never)
+  git.head = 'eee'
+  git.reflog = 'eee commit (initial): first'
+  await time.advance(10_000)
+  expect((boardOf(store, KEY_COMMIT) as Best).pb?.total).toBe(6_000)
+})
+
+test('a PR from a fork, opened on its parent, finishes the run; -R to an unrelated repo does not', async ($, on) => {
+  const { time, store } = world(on, '', 'git@github.com:me/acme.git')
+  gitWorld(on, {
+    head: 'aaa',
+    reflog: '',
+    remotes: 'origin\tgit@github.com:me/acme.git (fetch)\nupstream\thttps://github.com/org/acme.git (fetch)',
+    prs: '[]',
+  })
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    const url = String(e.command).includes('someone/else') ? 'https://github.com/someone/else/pull/9' : 'https://github.com/org/acme/pull/3'
+    return bash({ gitOperation: { pr: { number: 3, action: 'created', url } } })
+  })
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill -R someone/else' })
+  expect(boardOf(store, KEY)).toBe(undefined)
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill -R org/acme' })
+  expect((boardOf(store, KEY) as Best).pb?.total).toBe(2_000)
+})
+
+test('a fork PR with no -R finishes the run', async ($, on) => {
+  const { time, store } = world(on, '', 'git@github.com:me/acme.git')
+  gitWorld(on, { head: 'aaa', reflog: '', remotes: 'origin\tgit@github.com:me/acme.git (fetch)', prs: '[]', parent: 'org/acme' })
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    return bash({ gitOperation: { pr: { number: 4, action: 'created', url: 'https://github.com/org/acme/pull/4' } } })
+  })
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(3_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  expect((boardOf(store, KEY) as Best).pb?.total).toBe(3_000)
+})
+
+test('edits and tests in another repo do not split this run', async ($, on) => {
+  const { time, store } = world(on)
+  gitWorld(on, { head: 'aaa', reflog: '', remotes: '', prs: '[]' })
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    return String(e.command).includes('git commit') ? committed : bash()
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Edit', file_path: '/other/repo/a.ts', old_string: 'a', new_string: 'b' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a.ts', old_string: 'a', new_string: 'b' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'cd /other/repo && npm test' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  const best = boardOf(store, KEY_COMMIT) as Best
+  expect(best.pb?.splits).toEqual([null, 2_000, null, null, 4_000, null])
+})
+
+test('a test sent to the background never stamps the test run', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => (e.tool === 'Bash' && String(e.command).includes('git commit') ? committed : bash()))
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'npm test &' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  const best = boardOf(store, KEY_COMMIT) as Best
+  expect(best.pb?.splits[2]).toBe(null)
+  expect(best.pb?.splits[3]).toBe(null)
+})
+
+test('repo helpers', () => {
+  const coverageOnly = { bashEditDiff: { files: [{ filePath: '/work/acme/coverage/lcov.info' }], changedFiles: ['/work/acme/src/__snapshots__/a.snap'] } }
+  expect(changedCode(coverageOnly, '/work/acme')).toEqual([])
+  const real = { bashEditDiff: { files: [{ filePath: '/work/acme/src/a.ts' }, { filePath: '/tmp/x.ts' }] } }
+  expect(changedCode(real, '/work/acme')).toEqual(['/work/acme/src/a.ts', '/tmp/x.ts'])
+  expect(changedCode({ bashEditDiff: { changedFiles: ['src/../lib/b.ts'] } }, '/work/acme')).toEqual(['/work/acme/lib/b.ts'])
+  expect(testTarget('npm test')).toEqual({ kind: 'here' })
+  expect(testTarget('cd app && npm test')).toEqual({ kind: 'dir', dir: 'app' })
+  expect(testTarget('cd a && cd b && npm test')).toEqual({ kind: 'unknown' })
+  expect(testStarted(analyze('npm test &'), 'npm test &', true)).toBe(false)
+  expect(testStarted(analyze('npm test & wait'), 'npm test & wait', true)).toBe(false)
+})
+
+test('a backgrounded PR is picked up; one that was already on the branch is not', async ($, on) => {
+  const { time, store } = world(on)
+  const git: Git = {
+    head: 'aaa',
+    reflog: '',
+    remotes: '',
+    prs: JSON.stringify([{ url: 'https://github.com/org/acme/pull/1', createdAt: '2020-01-01T00:00:00Z' }]),
+  }
+  gitWorld(on, git)
+  on('tool.call', (_$, e) => (e.tool === 'Bash' ? bash({ backgroundTaskId: 'b3' }) : { result: { staged: false } }))
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(4_500)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill', run_in_background: true } as never)
+  await time.advance(10_000)
+  expect(boardOf(store, KEY)).toBe(undefined)
+  // Created in the command's own second, reported to the second.
+  const created = new Date(Math.floor(1_004_500 / 1000) * 1000).toISOString()
+  git.prs = JSON.stringify([
+    { url: 'https://github.com/org/acme/pull/1', createdAt: '2020-01-01T00:00:00Z' },
+    { url: 'https://github.com/org/acme/pull/2', createdAt: created },
+  ])
+  await time.advance(10_000)
+  expect((boardOf(store, KEY) as Best).pb?.total).toBe(4_500)
+})
+
+test('commit and PR are judged in their own directories', async ($, on) => {
+  const { time, store } = world(on, '', 'git@github.com:org/acme.git')
+  gitWorld(on, { head: 'aaa', reflog: '', remotes: '', prs: '[]' })
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    return bash({ gitOperation: { commit: { sha: 'c', kind: 'committed' }, pr: { number: 5, action: 'created' } } })
+  })
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(2_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am fix && cd /other/repo && gh pr create --fill' })
+  // The commit is this repo's; the PR was opened from another one.
+  expect(boardOf(store, KEY)).toBe(undefined)
+})
+
+test('a -R on another gh command is not the PR’s', async ($, on) => {
+  const { time, store } = world(on, '', 'git@github.com:org/acme.git')
+  on('tool.call', (_$, e) => (e.tool === 'Bash' ? bash({ gitOperation: { pr: { number: 6, action: 'created' } } }) : { result: { staged: false } }))
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(2_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr view 1 -R someone/else && gh pr create --fill' })
+  expect((boardOf(store, KEY) as Best).pb?.total).toBe(2_000)
+})
+
+test('installs and history moves are not first blood, whatever their options', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    if (String(e.command).includes('git commit')) return committed
+    return bash({ bashEditDiff: { files: [{ filePath: '/work/acme/src/a.ts' }], changedFiles: ['/work/acme/src/a.ts'] } })
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  for (const c of ['git -C . cherry-pick abc', 'pnpm --filter app install', 'sudo pip install x', 'python -m pip install x', 'env CI=1 npm ci', '  npm install', 'if true; then npm install foo; fi']) {
+    await $.tool.call({ tool: 'Bash', command: c })
+  }
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb).toBe(null)
+})
+
+test('an edit with no path, or to a snapshot, is not first blood', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => (e.tool === 'Bash' ? committed : { result: { staged: false } }))
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Write', file_path: '/work/acme/src/__snapshots__/a.snap', content: 'x' })
+  await $.tool.call({ tool: 'Write', content: 'x' } as never)
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb).toBe(null)
+})
+
+test('shell reading: background lists, indented cd, runner directory options', () => {
+  const list = 'npm test && echo done &'
+  expect(testStarted(analyze(list), list, true)).toBe(false)
+  expect(testStarted(analyze(list), list, false)).toBe(false)
+  expect(testTarget('  cd /other/repo && npm test')).toEqual({ kind: 'dir', dir: '/other/repo' })
+  expect(testTarget('\ncd /other/repo\nnpm test')).toEqual({ kind: 'dir', dir: '/other/repo' })
+  expect(testTarget('npm --prefix /other/repo test')).toEqual({ kind: 'dir', dir: '/other/repo' })
+  expect(testTarget('npm test; cd /other/repo')).toEqual({ kind: 'here' })
+  expect(gitTarget('  cd /other/repo && git commit -am x')).toEqual({ kind: 'dir', dir: '/other/repo' })
+  expect(gitTarget('git commit -am x && cd /o && gh pr create', 'pr')).toEqual({ kind: 'dir', dir: '/o' })
+  expect(gitTarget('git commit -am x && cd /o && gh pr create', 'commit')).toEqual({ kind: 'here' })
+  expect(ghRepoFlag('gh pr view 1 -R a/b && gh pr create --fill')).toBe(null)
+  expect(ghRepoFlag('gh pr create --fill -R org/acme')).toBe('org/acme')
+  expect(ghRepoFlag('GH_REPO=org/x gh pr create --fill')).toBe('org/x')
+})
+
+test('shell reading, round 2: quoted operators, early exits, subshell jobs, wrappers', () => {
+  expect(analyze("echo 'hello;pytest'").runsTest).toBe(false)
+  expect(analyze('echo "a && npm test"').runsTest).toBe(false)
+  const early = 'test -f package.json || exit 0; npm test'
+  expect(analyze(early).provesPass).toBe(false)
+  expect(testStarted(analyze(early), early, true)).toBe(false)
+  expect(analyze('npm test && (npm run dev &)').provesPass).toBe(true)
+  expect(testStarted(analyze('npm test && (npm run dev &)'), 'npm test && (npm run dev &)', true)).toBe(true)
+  expect(analyze('npm run dev & npx playwright test').provesPass).toBe(true)
+  expect(analyze('npm test & true').provesPass).toBe(false)
+  expect(analyze('sudo npm test').provesPass).toBe(true)
+  expect(testTarget('npm test; npm --prefix /other/repo test')).toEqual({ kind: 'unknown' })
+  expect(testTarget('(cd /other && true); npm test')).toEqual({ kind: 'here' })
+  expect(testTarget('cd app && (npm test)')).toEqual({ kind: 'dir', dir: 'app' })
+  expect(testTarget('npm test -- --prefix /other/repo')).toEqual({ kind: 'here' })
+  expect(testTarget('npm test && pushd /tmp')).toEqual({ kind: 'here' })
+  expect(hasCommit('echo git commit -m x')).toBe(false)
+  expect(hasCommit('sudo git -C . commit -am x')).toBe(true)
+  expect(hasPr('gh -R someone/else pr create')).toBe(true)
+  expect(ghRepoFlag('gh -R someone/else pr create')).toBe('someone/else')
+  expect(ghRepoFlag('GH_REPO=someone/else gh pr view 1; gh pr create --fill')).toBe(null)
+  expect(ghRepoFlag('git commit -m "GH_REPO=org/other" && gh pr create --fill')).toBe(null)
+  expect(ghRepoFlag('export GH_REPO=org/x; gh pr create --fill')).toBe('org/x')
+  expect(ghRepoFlag('gh pr create --repo "$TARGET"')).toBe('unknown')
+  expect(prHead('gh pr create --fill && gh pr list --head other')).toBe(null)
+  expect(prHead('gh pr create --head me:fix-1 --fill')).toBe('fix-1')
+})
+
+test('the host’s PR URL decides even when -R can’t be read', async ($, on) => {
+  const { time, store } = world(on, '', 'git@github.com:org/acme.git')
+  on('tool.call', (_$, e) =>
+    e.tool === 'Bash'
+      ? bash({ gitOperation: { pr: { number: 8, action: 'created', url: 'https://github.com/org/acme/pull/8' } } })
+      : { result: { staged: false } },
+  )
+  await $.prompt.submit(person('go'))
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(2_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill --repo "$TARGET"' })
+  expect((boardOf(store, KEY) as Best).pb?.total).toBe(2_000)
+})
+
+test('a fix and its tests in one call: first blood, test run and green', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    if (String(e.command).includes('git commit')) return committed
+    return bash({ bashEditDiff: { files: [{ filePath: '/work/acme/src/a.ts' }] } })
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(2_000)
+  await $.tool.call({ tool: 'Bash', command: 'python fix.py && npm test' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb?.splits).toEqual([null, 2_000, 2_000, 2_000, 3_000, null])
+})
+
+test('a baseline test before a shell change is not a test run', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    if (String(e.command).includes('git commit')) return committed
+    return bash({ bashEditDiff: { files: [{ filePath: '/work/acme/src/a.ts' }] } })
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(2_000)
+  await $.tool.call({ tool: 'Bash', command: 'npm test && sed -i s/a/b/ src/a.ts' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb?.splits).toEqual([null, 2_000, null, null, 3_000, null])
+})
+
+test('a shell change in another repo is not first blood', async ($, on) => {
+  const { time, store } = world(on)
+  gitWorld(on, { head: 'aaa', reflog: '', remotes: '', prs: '[]' })
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    if (String(e.command).includes('git commit')) return committed
+    return bash({ bashEditDiff: { files: [{ filePath: '/other/repo/a.ts' }, { filePath: '/work/acme/../other/b.ts' }] } })
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'python /other/repo/fix.py' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb).toBe(null)
+})
+
+test('a backgrounded test after the fix stamps the test run, never green', async ($, on) => {
+  const { time, store } = world(on)
+  on('tool.call', (_$, e) => {
+    if (e.tool !== 'Bash') return { result: { staged: false } }
+    if (String(e.command).includes('git commit')) return committed
+    return bash({ backgroundTaskId: 'b9' })
+  })
+  await $.command.run(splitsCommand('finish-on commit'))
+  await $.prompt.submit(person('go'))
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Edit', file_path: '/work/acme/a', old_string: 'a', new_string: 'b' })
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'npm test', run_in_background: true } as never)
+  await time.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am x' })
+  expect((boardOf(store, KEY_COMMIT) as Best).pb?.splits).toEqual([null, 1_000, 2_000, null, 3_000, null])
 })
